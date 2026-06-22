@@ -1,15 +1,124 @@
 #include "cujoagent_dcl_api.h"
 
+static gid_t cujoagent_get_group_id(const char *group_name) {
+  if (!group_name || *group_name == '\0') {
+    CcspTraceError(("Invalid group name\n"));
+    return (gid_t)-1;
+  }
+
+  ssize_t bufsize = sysconf(_SC_GETGR_R_SIZE_MAX);
+  if (bufsize == -1) {
+    bufsize = DEFAULT_GROUP_BUFFER_SIZE;
+  }
+
+  char *buf = malloc((size_t)bufsize);
+  if (buf == NULL) {
+    CcspTraceError(("Failed to allocate the buffer for group id\n"));
+    return (gid_t)-1;
+  }
+
+  struct group grp;
+  struct group *result = NULL;
+  int ret = getgrnam_r(group_name, &grp, buf, (size_t)bufsize, &result);
+  if (ret != 0 || result == NULL) {
+    CcspTraceError(
+        ("Failed to get group id for [%s]: [%d]\n", group_name, ret));
+    free(buf);
+    return (gid_t)-1;
+  }
+
+  gid_t group_id = grp.gr_gid;
+  free(buf);
+  return group_id;
+}
+
+static int cujoagent_dir_component(const char *path, mode_t mode,
+                                   gid_t group_id) {
+  if (!path || *path == '\0') {
+    CcspTraceError(("Invalid directory path component\n"));
+    return -1;
+  }
+
+  int r = mkdir(path, mode);
+  if (r == 0) {
+    CcspTraceDebug(
+        ("Changing the ownership of created directory [%s]\n", path));
+    if (chown(path, (gid_t)-1, group_id)) {
+      CcspTraceError(("Failed to change ownership of directory [%s]: [%d]\n",
+                      path, errno));
+      return -1;
+    }
+  } else if (errno != EEXIST) {
+    CcspTraceError(("Failed to create directory [%s]: [%d]\n", path, errno));
+    return -1;
+  }
+
+  return 0;
+}
+
+static int cujoagent_mkdir_parents(const char *path, mode_t mode,
+                                   gid_t group_id) {
+  if (!path || *path == '\0') {
+    CcspTraceError(("Invalid directory path\n"));
+    return -1;
+  }
+
+  char *subpath = strdup(path);
+  if (!subpath) {
+    CcspTraceError(("Subpath [%s] strdup failed\n", path));
+    return -1;
+  }
+
+  char *end = subpath + strlen(subpath) - 1;
+  if (end > subpath && *end == '/') {
+    *end = '\0';
+  }
+
+  mode_t orig_umask = umask(0);
+  char *p = subpath;
+  int result = 0;
+
+  while (*p != '\0') {
+    /* Skip the very first slash for absolute paths, so we don't accidentally
+     * change root's '/' ownership. */
+    if (*p == '/' && p != subpath) {
+      *p = '\0';
+      result = cujoagent_dir_component(subpath, mode, group_id);
+      if (result != 0) {
+        goto cleanup;
+      }
+      *p = '/';
+    }
+    p++;
+  }
+
+  result = cujoagent_dir_component(subpath, mode, group_id);
+
+cleanup:
+  free(subpath);
+  umask(orig_umask);
+  return result;
+}
+
 static int cujoagent_socket_init(cujoagent_wifi_consumer_t *consumer) {
   char *msg = NULL;
 
+  mode_t orig_umask = 0;
+  gid_t group_id = (gid_t)-1;
+
   char *socket_path = NULL;
-  int cmd = 0;
+  int socket_dir = 0;
 
   consumer->sock_fd = -1;
   int count = 0;
   struct sockaddr_un saddr = {.sun_family = AF_UNIX};
   size_t saddr_path_size = sizeof(saddr.sun_path);
+
+  group_id = cujoagent_get_group_id(CCSP_CUJOAGENT_GROUP);
+  if (group_id == (gid_t)-1) {
+    msg = "Failed to get group ID";
+    goto err;
+  }
 
   socket_path = strdup(CCSP_CUJOAGENT_SOCK_PATH);
   if (socket_path == NULL) {
@@ -17,10 +126,12 @@ static int cujoagent_socket_init(cujoagent_wifi_consumer_t *consumer) {
     goto err;
   }
 
-  cmd = v_secure_system("mkdir -p %s", dirname(socket_path));
+  /* drwxrwxr-x */
+  socket_dir = cujoagent_mkdir_parents(
+      dirname(socket_path), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH, group_id);
   free(socket_path);
 
-  if (cmd != 0) {
+  if (socket_dir != 0) {
     msg = "Failed to create parent directory for the socket path";
     goto err;
   }
@@ -42,9 +153,18 @@ static int cujoagent_socket_init(cujoagent_wifi_consumer_t *consumer) {
     goto err;
   }
 
+  /*  srw-rw---- */
+  orig_umask = umask(S_IRWXO | S_IXGRP | S_IXUSR);
   if (bind(consumer->sock_fd, (struct sockaddr *)&saddr,
            sizeof(struct sockaddr_un)) == -1) {
+    umask(orig_umask);
     msg = "Failed to bind to the socket";
+    goto err;
+  }
+  umask(orig_umask);
+
+  if (chown(CCSP_CUJOAGENT_SOCK_PATH, (uid_t)-1, group_id) == -1) {
+    msg = "Failed to change socket ownership";
     goto err;
   }
 
@@ -1440,13 +1560,29 @@ static void cujoagent_new_station_event(
   hash_map_t *assoc_dev_map = NULL;
   assoc_dev_data_t *assoc_dev_data = NULL;
   wifi_interface_name_idex_map_t *iface_map = NULL;
+  int vap_array_index = 0;
 
   /* Count clients across _all_ VAPs of interest */
   *station_update_event_size = sizeof(struct cujo_fpc_wifi_station_event);
   for (unsigned int i = 0; i < consumer->hal_cap.wifi_prop.numRadios; i++) {
     for (unsigned int j = 0; j < consumer->vap_subs_count; j++) {
+      iface_map = cujoagent_iface_property(
+          &consumer->hal_cap.wifi_prop, consumer->vap_subs_indexes[j]);
+      if (!iface_map) {
+        CcspTraceError(("Couldn't find interface map for VAP index [%u]\n",
+                        consumer->vap_subs_indexes[j]));
+        continue;
+      }
+      if (iface_map->rdk_radio_index != i) {
+        continue;
+      }
+      vap_array_index =
+          cujoagent_vap_array_index(&consumer->hal_cap.wifi_prop, iface_map);
+      if (vap_array_index < 0) {
+        continue;
+      }
       assoc_dev_map = consumer->radios[i]
-                          .vaps.rdk_vap_array[consumer->vap_subs_indexes[j]]
+                          .vaps.rdk_vap_array[vap_array_index]
                           .associated_devices_map;
       if (assoc_dev_map) {
         assoc_dev_count = hash_map_count(assoc_dev_map);
@@ -1466,28 +1602,25 @@ static void cujoagent_new_station_event(
   /* Populate the station update event with the list of _all_ connected clients */
   for (unsigned int i = 0, offset = 0; i < consumer->hal_cap.wifi_prop.numRadios; i++) {
     for (unsigned int j = 0; j < consumer->vap_subs_count; j++) {
+      iface_map = cujoagent_iface_property(
+          &consumer->hal_cap.wifi_prop, consumer->vap_subs_indexes[j]);
+      if (!iface_map) {
+        CcspTraceError(("Couldn't find interface map for VAP index [%u]\n",
+                        consumer->vap_subs_indexes[j]));
+        continue;
+      }
+      if (iface_map->rdk_radio_index != i) {
+        continue;
+      }
+      vap_array_index =
+          cujoagent_vap_array_index(&consumer->hal_cap.wifi_prop, iface_map);
+      if (vap_array_index < 0) {
+        continue;
+      }
       assoc_dev_map = consumer->radios[i]
-                          .vaps.rdk_vap_array[consumer->vap_subs_indexes[j]]
+                          .vaps.rdk_vap_array[vap_array_index]
                           .associated_devices_map;
       if (assoc_dev_map) {
-        /* We need the if_name of the VAP each client is connected to, not the
-         * if_name of the VAP where the particular (dis)connect event happened.
-         * Therefore, get the iface_map here rather than passing it as an
-         * argument from the diff map we are processing the particular station
-         * event for. */
-        iface_map = cujoagent_iface_property(
-            &consumer->hal_cap.wifi_prop,
-            consumer->radios[i]
-                .vaps.rdk_vap_array[consumer->vap_subs_indexes[j]]
-                .vap_index);
-        if (!iface_map) {
-          CcspTraceError(("Couldn't find interface map for vap index [%u]\n",
-                          consumer->radios[i]
-                              .vaps.rdk_vap_array[consumer->vap_subs_indexes[j]]
-                              .vap_index));
-          break;
-        }
-
         assoc_dev_count = hash_map_count(assoc_dev_map);
         assoc_dev_data = hash_map_get_first(assoc_dev_map);
         for (unsigned int k = 0; assoc_dev_data; k++) {
@@ -1928,20 +2061,22 @@ cujoagent_process_client_state(client_state_t client_state,
 
   for (unsigned int i = 0; i < consumer->hal_cap.wifi_prop.numRadios; i++) {
     for (unsigned int j = 0; j < consumer->vap_subs_count; j++) {
-      vap_array_index = consumer->vap_subs_indexes[j];
-      iface_map =
-          cujoagent_iface_property(&decoded_params->hal_cap.wifi_prop,
-                                   decoded_params->radios[i]
-                                       .vaps.rdk_vap_array[vap_array_index]
-                                       .vap_index);
+      iface_map = cujoagent_iface_property(
+          &decoded_params->hal_cap.wifi_prop, consumer->vap_subs_indexes[j]);
       if (!iface_map) {
-        CcspTraceError(("Couldn't find interface map for vap index [%u]\n",
-                        decoded_params->radios[i]
-                            .vaps.rdk_vap_array[vap_array_index]
-                            .vap_index));
+        CcspTraceError(("Couldn't find interface map for VAP index [%u]\n",
+                        consumer->vap_subs_indexes[j]));
         continue;
       }
-      radio = &decoded_params->radios[iface_map->rdk_radio_index];
+      if (iface_map->rdk_radio_index != i) {
+        continue;
+      }
+      vap_array_index = cujoagent_vap_array_index(
+          &decoded_params->hal_cap.wifi_prop, iface_map);
+      if (vap_array_index < 0) {
+        continue;
+      }
+      radio = &decoded_params->radios[i];
       vap_info = &radio->vaps.vap_map.vap_array[vap_array_index];
 
       assoc_dev_diff_map = decoded_params->radios[i]
